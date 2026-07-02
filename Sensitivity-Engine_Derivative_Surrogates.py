@@ -70,6 +70,11 @@ from itertools import product
 
 import numpy as np
 import pandas as pd
+
+try:
+    from scipy.special import ndtr as _normal_cdf
+except Exception:  # pragma: no cover - fallback for minimal environments
+    _normal_cdf = None
 from sklearn.neural_network import MLPRegressor
 from sklearn.preprocessing import StandardScaler
 
@@ -102,6 +107,28 @@ LOCAL_SOURCE_FILENAMES = {
 }
 
 
+def resolve_dtype(dtype_name: str):
+    """Return the NumPy floating dtype requested from the command line.
+
+    The empirical tables in the paper use double precision.  The explicit dtype
+    switch is included for numerical-diagnostics and reproducibility checks.
+    """
+    mapping = {"float64": np.float64, "float32": np.float32}
+    if dtype_name not in mapping:
+        raise ValueError(f"Unsupported dtype {dtype_name!r}. Use one of {sorted(mapping)}.")
+    return mapping[dtype_name]
+
+
+def as_float_array(x, dtype=np.float64) -> np.ndarray:
+    """Convert input to a NumPy floating array with the selected dtype."""
+    return np.asarray(x, dtype=dtype)
+
+
+def machine_epsilon(dtype=np.float64) -> float:
+    """Machine epsilon for the selected floating dtype."""
+    return float(np.finfo(dtype).eps)
+
+
 def default_data_dir() -> Path:
     """Return the folder that contains this script.
 
@@ -131,14 +158,47 @@ def numeric_series(s: pd.Series) -> pd.Series:
     return pd.to_numeric(s.astype(str).str.replace(",", "", regex=False), errors="coerce")
 
 
-def norm_pdf(x: np.ndarray) -> np.ndarray:
-    """Standard normal probability density function."""
-    return np.exp(-0.5 * x * x) / math.sqrt(2.0 * math.pi)
+def norm_pdf(x: np.ndarray, dtype=np.float64) -> np.ndarray:
+    """Standard normal probability density function in vectorized NumPy form."""
+    x = as_float_array(x, dtype)
+    two = np.asarray(2.0, dtype=dtype)
+    pi = np.asarray(np.pi, dtype=dtype)
+    return np.exp(-np.asarray(0.5, dtype=dtype) * x * x, dtype=dtype) / np.sqrt(two * pi, dtype=dtype)
 
 
-def norm_cdf(x: np.ndarray) -> np.ndarray:
-    """Standard normal cumulative distribution function."""
-    return 0.5 * (1.0 + np.vectorize(math.erf)(x / math.sqrt(2.0)))
+def norm_cdf(x: np.ndarray, dtype=np.float64) -> np.ndarray:
+    """Standard normal cumulative distribution function.
+
+    A scipy.special.ndtr backend is used when available because it is a stable
+    vectorized implementation in the tails.  The fallback keeps the script
+    runnable in minimal environments.
+    """
+    x = as_float_array(x, dtype)
+    if _normal_cdf is not None:
+        return np.asarray(_normal_cdf(x), dtype=dtype)
+    return np.asarray(0.5, dtype=dtype) * (
+        np.asarray(1.0, dtype=dtype) + np.vectorize(math.erf)(x / np.sqrt(np.asarray(2.0, dtype=dtype)))
+    )
+
+
+def safe_exp(x: np.ndarray, dtype=np.float64) -> np.ndarray:
+    """Exponentiate after clipping to the representable range of the dtype."""
+    x = as_float_array(x, dtype)
+    finfo = np.finfo(dtype)
+    return np.exp(np.clip(x, np.log(finfo.tiny), np.log(finfo.max)), dtype=dtype)
+
+
+def fd_base_step(dtype=np.float64, requested_step: float = 1e-3) -> float:
+    """Base finite-difference step for the price-only Model A Greeks.
+
+    Fourth-order centered first derivatives have an ideal scale of eps^(1/5),
+    while fourth-order centered second derivatives have an ideal scale closer to
+    eps^(1/6).  Gamma is the more sensitive diagnostic, so the implementation
+    uses the more conservative eps^(1/6) scale and never goes below the 
+    requested floor.
+    """
+    eps = np.asarray(np.finfo(dtype).eps, dtype=dtype)
+    return float(np.maximum(np.asarray(requested_step, dtype=dtype), np.power(eps, np.asarray(1.0 / 6.0, dtype=dtype), dtype=dtype)))
 
 
 def rmse(a: np.ndarray, b: np.ndarray) -> float:
@@ -296,11 +356,11 @@ def prepare_daily_state(df: pd.DataFrame) -> pd.DataFrame:
 # reference price / Delta / Gamma on the full fixed grid.
 # ============================================================================
 
-def piecewise_linear_extrap(x: np.ndarray, xp: np.ndarray, fp: np.ndarray) -> np.ndarray:
+def piecewise_linear_extrap(x: np.ndarray, xp: np.ndarray, fp: np.ndarray, dtype=np.float64) -> np.ndarray:
     """Piecewise-linear interpolation with linear extrapolation at both ends."""
-    x = np.asarray(x, dtype=float)
-    xp = np.asarray(xp, dtype=float)
-    fp = np.asarray(fp, dtype=float)
+    x = as_float_array(x, dtype)
+    xp = as_float_array(xp, dtype)
+    fp = as_float_array(fp, dtype)
     y = np.interp(x, xp, fp)
     left = x < xp[0]
     if np.any(left):
@@ -323,44 +383,60 @@ def alpha_tau(tau: np.ndarray) -> np.ndarray:
     return np.where(tau <= 30.0 / CALENDAR_DAYS_PER_YEAR, 0.8, 0.6)
 
 
-def gamma_stabilized_target(S: np.ndarray, gamma: np.ndarray) -> np.ndarray:
+def gamma_stabilized_target(S: np.ndarray, gamma: np.ndarray, dtype=np.float64) -> np.ndarray:
     """Transform Gamma to the stabilized training target asinh(S^2 * Gamma).
 
     This makes the Gamma head numerically easier to train while preserving a
     clean invertible map back to the original Gamma scale.
     """
-    S = np.asarray(S, dtype=float)
-    gamma = np.asarray(gamma, dtype=float)
-    return np.arcsinh((S ** 2) * gamma)
+    S = as_float_array(S, dtype)
+    gamma = as_float_array(gamma, dtype)
+    return np.arcsinh((S ** np.asarray(2.0, dtype=dtype)) * gamma, dtype=dtype)
 
 
-def gamma_from_stabilized(S: np.ndarray, gamma_tilde: np.ndarray) -> np.ndarray:
+def gamma_from_stabilized(S: np.ndarray, gamma_tilde: np.ndarray, dtype=np.float64) -> np.ndarray:
     """Invert the stabilized Gamma target back to ordinary Gamma."""
-    S = np.asarray(S, dtype=float)
-    gamma_tilde = np.asarray(gamma_tilde, dtype=float)
-    return np.sinh(gamma_tilde) / np.maximum(S ** 2, 1e-12)
+    S = as_float_array(S, dtype)
+    gamma_tilde = as_float_array(gamma_tilde, dtype)
+    tiny = np.asarray(1e-12, dtype=dtype)
+    return np.sinh(gamma_tilde, dtype=dtype) / np.maximum(S ** np.asarray(2.0, dtype=dtype), tiny)
 
 
-def bsm_call_price_delta_gamma(S: np.ndarray, K: np.ndarray, r: np.ndarray, tau: np.ndarray, sigma: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Standalone Black-Scholes-Merton call price, Delta, and Gamma engine."""
-    S = np.asarray(S, dtype=float)
-    K = np.asarray(K, dtype=float)
-    r = np.asarray(r, dtype=float)
-    tau = np.maximum(np.asarray(tau, dtype=float), 1e-6)
-    sigma = np.maximum(np.asarray(sigma, dtype=float), 1e-6)
-    sqrt_tau = np.sqrt(tau)
-    d1 = (np.log(np.maximum(S, 1e-12) / np.maximum(K, 1e-12)) + (r + 0.5 * sigma * sigma) * tau) / (sigma * sqrt_tau)
+def bsm_call_price_delta_gamma(
+    S: np.ndarray,
+    K: np.ndarray,
+    r: np.ndarray,
+    tau: np.ndarray,
+    sigma: np.ndarray,
+    dtype=np.float64,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Standalone Black-Scholes-Merton call price, Delta, and Gamma engine.
+
+    The implementation uses double precision by default, a stable vectorized
+    normal CDF, and a log-ratio formula log(S)-log(K).
+    """
+    S = as_float_array(S, dtype)
+    K = as_float_array(K, dtype)
+    r = as_float_array(r, dtype)
+    tau = np.maximum(as_float_array(tau, dtype), np.asarray(1e-8, dtype=dtype))
+    sigma = np.maximum(as_float_array(sigma, dtype), np.asarray(1e-8, dtype=dtype))
+    tiny = np.asarray(1e-12, dtype=dtype)
+    sqrt_tau = np.sqrt(tau, dtype=dtype)
+    log_ratio = np.log(np.maximum(S, tiny), dtype=dtype) - np.log(np.maximum(K, tiny), dtype=dtype)
+    half = np.asarray(0.5, dtype=dtype)
+    d1 = (log_ratio + (r + half * sigma * sigma) * tau) / (sigma * sqrt_tau)
     d2 = d1 - sigma * sqrt_tau
-    Nd1 = norm_cdf(d1)
-    Nd2 = norm_cdf(d2)
-    nd1 = norm_pdf(d1)
-    price = S * Nd1 - K * np.exp(-r * tau) * Nd2
+    Nd1 = norm_cdf(d1, dtype=dtype)
+    Nd2 = norm_cdf(d2, dtype=dtype)
+    nd1 = norm_pdf(d1, dtype=dtype)
+    discount = safe_exp(-r * tau, dtype=dtype)
+    price = S * Nd1 - K * discount * Nd2
     delta = Nd1
-    gamma = nd1 / np.maximum(S * sigma * sqrt_tau, 1e-12)
+    gamma = nd1 / np.maximum(S * sigma * sqrt_tau, tiny)
     return price, delta, gamma
 
 
-def build_teacher_panel(daily: pd.DataFrame) -> pd.DataFrame:
+def build_teacher_panel(daily: pd.DataFrame, dtype=np.float64) -> pd.DataFrame:
     """Expand the daily state into the full option panel used for learning.
 
     For each calendar date, the script evaluates the teacher on the fixed
@@ -392,8 +468,8 @@ def build_teacher_panel(daily: pd.DataFrame) -> pd.DataFrame:
         # Fill one date-sized block at a time.  Each block contains all 9 x 15
         # contracts for that trading day.
         sl = slice(i * block, (i + 1) * block)
-        rates[sl] = piecewise_linear_extrap(tau_block, rate_x, np.array([row["DGS3MO"], row["DGS2"], row["DGS10"]], dtype=float) / 100.0)
-        iv_tau[sl] = np.maximum(piecewise_linear_extrap(tau_block, iv_x, np.array([row["IV30"], row["IV90"]], dtype=float)), 1e-6)
+        rates[sl] = piecewise_linear_extrap(tau_block, rate_x, np.array([row["DGS3MO"], row["DGS2"], row["DGS10"]], dtype=dtype) / np.asarray(100.0, dtype=dtype), dtype=dtype)
+        iv_tau[sl] = np.maximum(piecewise_linear_extrap(tau_block, iv_x, np.array([row["IV30"], row["IV90"]], dtype=dtype), dtype=dtype), np.asarray(1e-6, dtype=dtype))
 
     # Teacher volatility follows the empirical subsection's simple blend:
     # short maturities lean more heavily on IV, while longer maturities retain
@@ -402,8 +478,8 @@ def build_teacher_panel(daily: pd.DataFrame) -> pd.DataFrame:
 
     # The option grid is parameterized in log-moneyness k, so strike is rebuilt
     # via K = S * exp(k) before the teacher labels are generated.
-    K_rep = S_rep * np.exp(k_rep)
-    price, delta, gamma = bsm_call_price_delta_gamma(S_rep, K_rep, rates, tau_rep, sigma_rep)
+    K_rep = S_rep * safe_exp(k_rep, dtype=dtype)
+    price, delta, gamma = bsm_call_price_delta_gamma(S_rep, K_rep, rates, tau_rep, sigma_rep, dtype=dtype)
 
     panel = pd.DataFrame(
         {
@@ -494,6 +570,7 @@ class TrainedModel:
     boundary_h: float = BOUNDARY_K_MAX
     selection_score: Optional[float] = None
     candidate_tag: str = ""
+    dtype_name: str = "float64"
 
 
 FEATURE_COLS = ["k", "tau", "r_tau", "RV20", "RV60", "IV30", "IV90", "IV_slope"]
@@ -593,7 +670,8 @@ def fit_structured_candidate(
 
     # Stabilize Gamma before training and incorporate the Delta / Gamma weights
     # directly into the targets through sqrt(lambda) factors.
-    gamma_train_tilde = gamma_stabilized_target(train_df["S"].values, train_df["gamma_teacher"].values)
+    dtype = resolve_dtype(args.dtype)
+    gamma_train_tilde = gamma_stabilized_target(train_df["S"].values, train_df["gamma_teacher"].values, dtype=dtype)
     Y_train = np.column_stack(
         [
             train_df["price_teacher"].values,
@@ -639,6 +717,7 @@ def fit_structured_candidate(
         fd_k_step=args.fd_k_step,
         boundary_lambda=boundary_lambda,
         boundary_h=float(args.boundary_h if boundary_h is None else boundary_h),
+        dtype_name=args.dtype,
     )
 
 
@@ -699,7 +778,7 @@ def fit_models(train_df: pd.DataFrame, val_df: pd.DataFrame, seed: int, args: ar
         n_iter_no_change=args.patience,
     )
     model_A.fit(X_train, train_df["price_teacher"].values)
-    trained_A = TrainedModel("Model_A", model_A, x_scaler, None, "A", args.lambda_delta, args.lambda_gamma, args.fd_k_step)
+    trained_A = TrainedModel("Model_A", model_A, x_scaler, None, "A", args.lambda_delta, args.lambda_gamma, args.fd_k_step, dtype_name=args.dtype)
 
     # Model A provides the baseline metric vector that B and C are judged
     # against on the validation set.
@@ -821,12 +900,22 @@ def predict_price_delta_gamma(trained: TrainedModel, df: pd.DataFrame) -> Tuple[
         #   c_k  = dC/dk
         #   c_kk = d^2C/dk^2
         # then use the k-to-S identities implied by K = S exp(k).
-        df_up = df.copy(); df_up["k"] = df_up["k"] + trained.fd_k_step; df_up["IV_slope"] = df_up["IV90"] - df_up["IV30"]
-        df_dn = df.copy(); df_dn["k"] = df_dn["k"] - trained.fd_k_step; df_dn["IV_slope"] = df_dn["IV90"] - df_dn["IV30"]
-        price_up = predict_price_only(trained, df_up)
-        price_dn = predict_price_only(trained, df_dn)
-        c_k = (price_up - price_dn) / (2.0 * trained.fd_k_step)
-        c_kk = (price_up - 2.0 * price0 + price_dn) / (trained.fd_k_step ** 2)
+        #
+        # A fourth-order centered stencil is used rather than the simpler
+        # three-point formula.  This lowers truncation error, while the adaptive
+        # h floor avoids making the second derivative dominated by roundoff.
+        dtype = resolve_dtype(trained.dtype_name)
+        h = fd_base_step(dtype=dtype, requested_step=trained.fd_k_step)
+        df_p1 = df.copy(); df_p1["k"] = df_p1["k"] + h; df_p1["IV_slope"] = df_p1["IV90"] - df_p1["IV30"]
+        df_m1 = df.copy(); df_m1["k"] = df_m1["k"] - h; df_m1["IV_slope"] = df_m1["IV90"] - df_m1["IV30"]
+        df_p2 = df.copy(); df_p2["k"] = df_p2["k"] + 2.0 * h; df_p2["IV_slope"] = df_p2["IV90"] - df_p2["IV30"]
+        df_m2 = df.copy(); df_m2["k"] = df_m2["k"] - 2.0 * h; df_m2["IV_slope"] = df_m2["IV90"] - df_m2["IV30"]
+        price_p1 = predict_price_only(trained, df_p1)
+        price_m1 = predict_price_only(trained, df_m1)
+        price_p2 = predict_price_only(trained, df_p2)
+        price_m2 = predict_price_only(trained, df_m2)
+        c_k = (-price_p2 + 8.0 * price_p1 - 8.0 * price_m1 + price_m2) / (12.0 * h)
+        c_kk = (-price_p2 + 16.0 * price_p1 - 30.0 * price0 + 16.0 * price_m1 - price_m2) / (12.0 * h * h)
         S = df["S"].values
         delta = -c_k / np.maximum(S, 1e-8)
         gamma = (c_kk + c_k) / np.maximum(S ** 2, 1e-8)
@@ -840,7 +929,7 @@ def predict_price_delta_gamma(trained: TrainedModel, df: pd.DataFrame) -> Tuple[
     # Undo the sqrt(lambda) weighting baked into the training targets.
     delta = pred[:, 1] / np.sqrt(trained.lambda_delta)
     gamma_tilde = pred[:, 2] / np.sqrt(trained.lambda_gamma)
-    gamma = gamma_from_stabilized(df["S"].values, gamma_tilde)
+    gamma = gamma_from_stabilized(df["S"].values, gamma_tilde, dtype=resolve_dtype(trained.dtype_name))
     return price, delta, gamma
 
 
@@ -1062,6 +1151,20 @@ def sample_count_table(panel: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+
+def numerical_diagnostics_table(args: argparse.Namespace) -> pd.DataFrame:
+    """Record numerical-analysis choices used in the empirical run."""
+    dtype = resolve_dtype(args.dtype)
+    return pd.DataFrame([
+        {"item": "floating_dtype", "value": args.dtype, "comment": "Teacher labels and finite-difference diagnostics use this dtype."},
+        {"item": "machine_epsilon", "value": f"{machine_epsilon(dtype):.18e}", "comment": "Roundoff scale for the selected dtype."},
+        {"item": "model_a_fd_order", "value": "4", "comment": "Fourth-order centered stencil in log-moneyness k."},
+        {"item": "model_a_requested_fd_step", "value": f"{args.fd_k_step:.18e}", "comment": "Requested finite-difference floor."},
+        {"item": "model_a_effective_fd_step", "value": f"{fd_base_step(dtype, args.fd_k_step):.18e}", "comment": "max(requested step, eps^(1/6)) for Gamma stability."},
+        {"item": "normal_cdf_backend", "value": "scipy.special.ndtr" if _normal_cdf is not None else "math.erf fallback", "comment": "Vectorized stable normal CDF for BSM labels."},
+        {"item": "gamma_target", "value": "asinh(S^2 * gamma)", "comment": "Scale-stabilized Gamma target for Models B and C."},
+    ])
+
 def write_table(df: pd.DataFrame, csv_path: Path) -> None:
     """Write one table as CSV file."""
     df.to_csv(csv_path, index=False)
@@ -1116,6 +1219,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max-test-samples", type=int, default=0)
     p.add_argument("--max-hedge-paths", type=int, default=0)
     p.add_argument("--seed", type=int, default=1234)
+    p.add_argument("--dtype", type=str, choices=["float64", "float32"], default="float64", help="Floating dtype for teacher labels and numerical diagnostics. Paper tables use float64.")
     return p.parse_args()
 
 
@@ -1138,7 +1242,8 @@ def main() -> None:
 
     # Step 2. Expand the daily state into the full teacher-labeled option panel
     # and assign train / validation / test splits.
-    panel = assign_splits(build_teacher_panel(daily), use_mock=args.mock_data)
+    dtype = resolve_dtype(args.dtype)
+    panel = assign_splits(build_teacher_panel(daily, dtype=dtype), use_mock=args.mock_data)
     panel.to_csv(data_dir / "teacher_panel_full.csv", index=False)
 
     # Step 3. Optionally subsample for faster experimentation, then fit the
@@ -1176,11 +1281,13 @@ def main() -> None:
     table_counts = sample_count_table(panel)
     global_metrics, local_metrics = build_metrics_tables(pred_frames)
     hedge = hedging_metrics(test_df, daily, models, max_paths=args.max_hedge_paths)
+    numerical_diagnostics = numerical_diagnostics_table(args)
 
     write_table(table_counts, table_dir / "table_sample_counts.csv")
     write_table(global_metrics, table_dir / "table_global_metrics.csv")
     write_table(local_metrics, table_dir / "table_local_boundary_metrics.csv")
     write_table(hedge, table_dir / "table_hedging_metrics.csv")
+    write_table(numerical_diagnostics, table_dir / "table_numerical_diagnostics.csv")
 
     # Step 6. Write a manifest so the run is self-documenting.
     manifest = {
@@ -1196,12 +1303,15 @@ def main() -> None:
             str(table_dir / "table_global_metrics.csv"),
             str(table_dir / "table_local_boundary_metrics.csv"),
             str(table_dir / "table_hedging_metrics.csv"),
+            str(table_dir / "table_numerical_diagnostics.csv"),
         ],
         "notes": [
             "Teacher labels are generated with a standalone BSE-style BSM call engine.",
             "Dividend yield q is fixed at 0.0 to match the subsection design.",
             "Model A is price-only; Models B and C use weighted multi-output Greek supervision.",
             "The Gamma head is trained on asinh(S^2 gamma) and inverted back at prediction time.",
+            "Model A Greeks use a fourth-order centered stencil in log-moneyness with an epsilon-based step floor for Gamma stability.",
+            "The BSM teacher uses a stable vectorized normal CDF and log-ratio d1 construction.",
             "Models B and C are selected on validation scores that explicitly emphasize local boundary-region price RMSE while retaining local Delta and Gamma objectives.",
             "Model C uses a separate rebalanced candidate search with softer boundary/gamma settings and a more price-aware selector; Model B is unchanged.",
         ],

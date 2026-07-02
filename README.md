@@ -12,7 +12,7 @@ Three surrogate specifications are compared:
 - **Model B**: Greek-regularized multi-output multilayer perceptron
 - **Model C**: boundary-aware Greek-regularized multi-output multilayer perceptron
 
-The code builds daily states, constructs the teacher panel, trains the three models, evaluates global and local pricing/Greek errors, and runs a five-day local hedging backtest.
+The code builds daily states, constructs the teacher panel, trains the three models, evaluates global and local pricing/Greek errors, records basic numerical diagnostics, and runs a five-day local hedging backtest.
 
 ## Empirical design
 
@@ -65,16 +65,37 @@ with
 - $\alpha(\tau) = 0.8$ for $\tau\le 30/365$
 - $\alpha(\tau) = 0.6$ otherwise.
 
+The implementation uses double precision by default, a stable vectorized normal CDF backend when SciPy is available, and a log-ratio construction for the BSM `d1` term.
+
 ### Targets used in training
 
 - Model A is trained on prices only.
-- Models B and C are trained on
+- Models B and C are trained on the multi-output target
 
 $$
 y=\bigl(\mathrm{price},\ \sqrt{\lambda_{\Delta}}\ \Delta,\ \sqrt{\lambda_{\Gamma}}\ \mathrm{asinh}(S^{2}\Gamma)\bigr).
 $$
 
 The transformed Gamma target stabilizes the second-order channel while preserving an invertible mapping back to ordinary Gamma.
+
+### Numerical-accuracy controls
+
+The script records the following numerical diagnostics in `table_numerical_diagnostics.csv`:
+
+- floating dtype, default `float64`
+- machine epsilon
+- fourth-order centered finite-difference stencil for Model A Greeks
+- requested and effective finite-difference step
+- normal-CDF backend
+- Gamma target transformation
+
+Model A reconstructs Greeks from price predictions by fourth-order centered finite differences in log-moneyness. The effective finite-difference step is
+
+$$
+h_{\mathrm{fd}} = \max\left\{h_{\mathrm{requested}},\,\epsilon_{\mathrm{mach}}^{1/6}\right\}.
+$$
+
+so that the second-derivative reconstruction is not dominated by roundoff.
 
 ## Default parameter settings
 
@@ -93,6 +114,7 @@ The default command-line parameters are:
 - `boundary_h = 0.02`
 - `fd_k_step = 1e-3`
 - `seed = 1234`
+- `dtype = float64`
 
 Model B and Model C use separate validation-selection grids, with Model C receiving the broader boundary-aware search.
 
@@ -113,7 +135,7 @@ The script writes:
 - cleaned daily market states
 - full teacher panel
 - test-set prediction files for Models A, B, and C
-- CSV summary tables for sample counts, global metrics, local-boundary metrics, and hedging metrics
+- CSV summary tables for sample counts, global metrics, local-boundary metrics, hedging metrics, and numerical diagnostics
 - serialized model artifacts and a manifest file
 
 ## Installation
@@ -142,12 +164,19 @@ A mock-data dry run is also available:
 python Sensitivity-Engine_Derivative_Surrogates.py --mock-data
 ```
 
+To run with an explicit output folder:
+
+```bash
+python Sensitivity-Engine_Derivative_Surrogates.py --data-dir /path/to/csv_folder --output-dir SEDS_empirical_outputs
+```
+
 ## Repository layout
 
 ```text
 Sensitivity-Engine_Derivative_Surrogates.py
 requirements.txt
 .gitignore
+LICENSE
 README.md
 ```
 
