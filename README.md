@@ -92,7 +92,7 @@ The script records the following numerical diagnostics in `table_numerical_diagn
 Model A reconstructs Greeks from price predictions by fourth-order centered finite differences in log-moneyness. The effective finite-difference step is
 
 $$
-h_{\mathrm{fd}} = \max\left\{h_{\mathrm{requested}},\,\epsilon_{\mathrm{mach}}^{1/6}\right\}.
+h_{\mathrm{fd}} = \max(h_{\mathrm{requested}},\ \epsilon_{\mathrm{mach}}^{1/6}).
 $$
 
 so that the second-derivative reconstruction is not dominated by roundoff.
