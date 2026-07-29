@@ -1,0 +1,7 @@
+filename,source,retrieved_on,sha256,file_size_bytes,usable_rows,start_date,end_date,required_columns,notes
+spx_stooq.csv,Stooq SPX historical daily series,,,,,,,Date;Close,
+DGS3MO.csv,FRED DGS3MO,,,,,,,Date;DGS3MO,
+DGS2.csv,FRED DGS2,,,,,,,Date;DGS2,
+DGS10.csv,FRED DGS10,,,,,,,Date;DGS10,
+VIXCLS.csv,FRED VIXCLS,,,,,,,Date;VIXCLS,
+VXVCLS.csv,FRED VXVCLS,,,,,,,Date;VXVCLS,

@@ -1,0 +1,21 @@
+cff-version: 1.2.0
+message: "Please cite this software when using this repository."
+title: "Sensitivity-Engine Derivative Surrogates: Greek- and Structure-Consistent Supervision"
+type: software
+authors:
+  - family-names: Shen
+    given-names: David Hongkai
+repository-code: "https://github.com/DavidHShen/Sensitivity-Engine_Derivative_Surrogates"
+url: "https://github.com/DavidHShen/Sensitivity-Engine_Derivative_Surrogates"
+license: MIT
+date-released: 2026-04-01
+abstract: >-
+  Empirical implementation and manuscript for a matched comparison of
+  price-potential, direct-Greek, potential-consistent, and two-leg
+  decomposition-consistent derivative surrogates.
+keywords:
+  - derivative surrogates
+  - option Greeks
+  - automatic differentiation
+  - structural consistency
+  - scientific computing
